@@ -7,28 +7,59 @@ import json
 import os
 from dotenv import load_dotenv
 
-import pandas as pd
-
 import requests
 import xml.etree.ElementTree as ET
 import datetime
 
+from IPython.display import Markdown
+
 from chromadb import Documents, EmbeddingFunction, Embeddings
-# from google.api_core import retry
 import chromadb
-from nltk.corpus.reader import documents
 
-
-from numpy.array_api import result_type
-from starlette.routing import request_response
-
+## set up env
 load_dotenv()
+
+## set up Google GenAI client
 GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY')
 client = genai.Client(api_key=GOOGLE_API_KEY)
 
 
 
+## start chromadb
+is_retriable = lambda e: (isinstance(e, genai.errors.APIError) and e.code in {429, 503})
+
+class GeminiEmbeddingFunction(EmbeddingFunction):
+    # Specify whether to generate embeddings for documents, or queries
+    document_mode = True
+
+    # @retry.Retry(predicate=is_retriable)
+    def __call__(self, input: Documents) -> Embeddings:
+        if self.document_mode:
+            embedding_task = "retrieval_document"
+        else:
+            embedding_task = "retrieval_query"
+
+        response = client.models.embed_content(
+            model="models/text-embedding-004",
+            contents=input,
+            config=types.EmbedContentConfig(
+                task_type=embedding_task,
+            ),
+        )
+        return [e.values for e in response.embeddings]
+
+
+DB_NAME = "arxiv_results"
+
+embed_fn = GeminiEmbeddingFunction()
+embed_fn.document_mode = True
+
+chroma_client = chromadb.Client()
+db = chroma_client.get_or_create_collection(name=DB_NAME, embedding_function=embed_fn)
+
+
 def get_model_response(prompt: str) -> str:
+    # standard model response
     config = types.GenerateContentConfig(temperature=0.0)
     response = client.models.generate_content(
         model="gemini-2.0-flash",
@@ -40,6 +71,9 @@ def get_model_response(prompt: str) -> str:
 
 
 def generate_best_query(request: str, main_query=False) -> list:
+    # generates an arXiv API call.
+    # generates an API call matching the user request, including 3 pages of results (main_query = True)
+    # generates a single API call matching the sub-topics (main_query = False)
     prompt = f'''You are a helpful research assistant doing a literature review. The researcher says: "{request}". What would be the most accurate arXiv API call to find this information? Please provide the API call alone, no need for an explanation. 
         INSTRUCTIONS: 
         Step 1 - consider how an arXiv API call is constructed. 
@@ -59,7 +93,8 @@ def generate_best_query(request: str, main_query=False) -> list:
     return best_query
 
 
-def generate_subtopic_query(request: str) -> list:
+def generate_subtopic_query(request: str, number_of_subtopics: int) -> tuple:
+    # generates a list of subtopics
     prompt = f'''You are a helpful research assistant doing a literature review. The researcher says: "{request}". What would be {number_of_subtopics} relevant sub-topics to gain a better understanding of this matter? Please provide a list of these topics. Provide no explanation. Return a Python list. '''
 
     close_topics = get_model_response(prompt)
@@ -77,15 +112,17 @@ def generate_subtopic_query(request: str) -> list:
 
     return subtopics, subtopic_queries
 
-def generate_search_queries(request: str) -> list:
+def generate_search_queries(request: str, number_of_subtopics: int) -> tuple:
+    # generates all the necessary API calls for the DB.
     main_query = generate_best_query(request, main_query=True)
-    subtopic_results = generate_subtopic_query(request)
+    subtopic_results = generate_subtopic_query(request, number_of_subtopics)
     subtopic_queries = subtopic_results[1]
     subtopic_list = subtopic_results[0]
     return main_query + subtopic_queries, subtopic_list
 
 
 def get_arxiv_metadata(url: str, topic: str) -> tuple:
+    # gets the metadata from arXiv API - article ID, summary, title, authors, and latest update date.
     arxiv_entries = {}
 
     url = url.replace(" ", "").replace("`", "")
@@ -125,40 +162,10 @@ def get_arxiv_metadata(url: str, topic: str) -> tuple:
 
 
 
-# Define a helper to retry when per-minute quota is reached.
-is_retriable = lambda e: (isinstance(e, genai.errors.APIError) and e.code in {429, 503})
-
-class GeminiEmbeddingFunction(EmbeddingFunction):
-    # Specify whether to generate embeddings for documents, or queries
-    document_mode = True
-
-    # @retry.Retry(predicate=is_retriable)
-    def __call__(self, input: Documents) -> Embeddings:
-        if self.document_mode:
-            embedding_task = "retrieval_document"
-        else:
-            embedding_task = "retrieval_query"
-
-        response = client.models.embed_content(
-            model="models/text-embedding-004",
-            contents=input,
-            config=types.EmbedContentConfig(
-                task_type=embedding_task,
-            ),
-        )
-        return [e.values for e in response.embeddings]
-
-
-DB_NAME = "arxiv_results"
-
-embed_fn = GeminiEmbeddingFunction()
-embed_fn.document_mode = True
-
-chroma_client = chromadb.Client()
-db = chroma_client.get_or_create_collection(name=DB_NAME, embedding_function=embed_fn)
 
 
 def generate_db_content(call_list: list, subtopics: list):
+    # populates the db with the results of the API calls.
     counter = 0
     subtopic_idx = 0
     n = len(subtopics)
@@ -177,44 +184,42 @@ def generate_db_content(call_list: list, subtopics: list):
                        ids=[article_id])
                 counter += 1
 
-full_result = generate_search_queries(query)
-r, st = full_result[0], full_result[1]
 
-generate_db_content(r, st)
+def get_query_results(query: str) -> tuple:
+    # retrieves the relevant articles from the DB - the best article as ranked by arXiv, 3-4 more articles from the DB
 
+    embed_fn.document_mode = False
 
-embed_fn.document_mode = False
+    result = db.query(query_texts=[query], n_results= 3 + 1)
 
-result = db.query(query_texts=[query], n_results= 3 + 1)
-
-[all_passages] = result["documents"]
-all_titles = [j["title"] for i in result["metadatas"] for j in i]
-all_authors = [j["authors"] for i in result["metadatas"] for j in i]
-[all_ids] = result["ids"]
+    [all_passages] = result["documents"]
+    all_titles = [j["title"] for i in result["metadatas"] for j in i]
+    all_authors = [j["authors"] for i in result["metadatas"] for j in i]
+    [all_ids] = result["ids"]
 
 
-best_article = db.peek(1)
+    best_article = db.peek(1)
 
-best_article = [best_article["metadatas"][0]["title"], best_article["metadatas"][0]["authors"], best_article["documents"], best_article["ids"]]
+    best_article = [best_article["metadatas"][0]["title"], best_article["metadatas"][0]["authors"], best_article["documents"], best_article["ids"]]
 
-exclude_best = '0' in result["ids"][0]
+    exclude_best = '0' in result["ids"][0]
 
-if exclude_best:
-    q = all_ids.index('0')
-    # best_passage = all_passages[q]
-    # best_title = all_titles[q]
-    # best_metadata = result["metadatas"][q]
-    all_titles = all_titles[:q] + all_titles[q + 1:]
-    all_passages = all_passages[:q] + all_passages[q + 1:]
-    all_ids = all_ids[:q] + all_ids[q + 1:]
-    all_authors = all_authors[:q] + all_authors[q + 1:]
+    if exclude_best:
+        q = all_ids.index('0')
+        all_titles = all_titles[:q] + all_titles[q + 1:]
+        all_passages = all_passages[:q] + all_passages[q + 1:]
+        all_ids = all_ids[:q] + all_ids[q + 1:]
+        all_authors = all_authors[:q] + all_authors[q + 1:]
 
 
 
-more_article_data = list(zip(all_titles, all_authors, all_passages, all_ids))
+    more_article_data = list(zip(all_titles, all_authors, all_passages, all_ids))
+
+    return more_article_data, best_article, all_ids
 
 
 def get_subtopic_articles(subtopics: list, ids: list) -> list:
+    # retrieves the best article for each subtopic, if it didn't appear before.
     subtopic_contents = []
 
     for subtopic in subtopics:
@@ -241,7 +246,11 @@ def get_subtopic_articles(subtopics: list, ids: list) -> list:
     return subtopic_contents
 
 
-def generate_summary(request: str, subtopics = st, ids = all_ids) -> str:
+
+
+def generate_summary(request: str, subtopics: list, ids: list, best_article: list, more_article_data: list) -> str:
+    # generates a summary of all the retrieved articles.
+
     prompt = f'''You are a helpful research assistant. The researcher says: "{request}". 
 Here is the data on the main article on the topic:
  {best_article}
@@ -253,21 +262,38 @@ Please don't explain that you got it.
 '''
 
     response = get_model_response(prompt)
-    if not subtopics:
-        return response
-    else:
+    if subtopics:
         subtopic_string = "\n".join(subtopics)
         keyword_text = (f"\n\n\n----some helpful keywords/topics may be: {subtopic_string}")
 
         subtopic_articles = get_subtopic_articles(subtopics, ids=ids)
-        subtopics_prompt = f'''You are a helpful research assistant. The researcher says: "{request}". 
-Here are some articles that another assistant suggested to further explore this matter: 
-{subtopic_articles}
+        if subtopic_articles:
+            subtopics_prompt = f'''You are a helpful research assistant. The researcher says: "{request}". 
+    Here are some articles that another assistant suggested to further explore this matter: 
+    {subtopic_articles}
+    
+    Please provide a short summary of how the things discussed in the articles add to the concept the researcher was talking about. 
+    For each article mentioned, be sure to include the article title, authors, and id.  
+    If no article is relevant, simply return " ".
+    Please don't explain that you got it. 
+    '''
+            subtopics_response = get_model_response(subtopics_prompt)
+            return response + keyword_text + "\n\n\n" + subtopics_response
 
-Please provide a short summary of how the things discussed in the articles add to the concept the researcher was talking about. 
-For each article mentioned, be sure to include the article title, authors, and id.  
-If no article is relevant, simply return " ".
-Please don't explain that you got it. 
-'''
-        subtopics_response = get_model_response(subtopics_prompt)
-        return response + keyword_text + "\n\n\n" + subtopics_response
+    return response
+
+
+def ai_research_assistant(query: str, number_of_subtopics: int) -> str:
+    # main function - runs the whole process
+    full_result = generate_search_queries(query, number_of_subtopics)
+    r, st = full_result[0], full_result[1]
+
+    generate_db_content(r, st)
+
+    query_results = get_query_results(query)
+    more_article_data = query_results[0]
+    best_article = query_results[1]
+    all_ids = query_results[2]
+
+    summary = generate_summary(query, st, all_ids, best_article, more_article_data)
+    return summary
